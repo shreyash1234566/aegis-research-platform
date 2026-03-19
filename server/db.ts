@@ -1,4 +1,4 @@
-import { eq } from "drizzle-orm";
+import { desc, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/mysql2";
 import {
   InsertUser,
@@ -141,6 +141,21 @@ export async function updateDocumentStatus(id: number, status: string, error?: s
   await db.update(documents).set(updateData).where(eq(documents.id, id));
 }
 
+export async function updateDocumentFields(
+  id: number,
+  fields: Partial<InsertDocument>
+) {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+  await db.update(documents).set(fields as any).where(eq(documents.id, id));
+}
+
+export async function deleteDocumentById(id: number) {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+  await db.delete(documents).where(eq(documents.id, id));
+}
+
 // Document summary queries
 export async function createDocumentSummary(summary: InsertDocumentSummary) {
   const db = await getDb();
@@ -153,6 +168,15 @@ export async function getDocumentSummary(documentId: number) {
   if (!db) throw new Error("Database not available");
   const result = await db.select().from(documentSummaries).where(eq(documentSummaries.documentId, documentId)).limit(1);
   return result.length > 0 ? result[0] : undefined;
+}
+
+export async function getDocumentSummariesByDocumentIds(documentIds: number[]) {
+  const summaries: Array<NonNullable<Awaited<ReturnType<typeof getDocumentSummary>>>> = [];
+  for (const documentId of documentIds) {
+    const summary = await getDocumentSummary(documentId);
+    if (summary) summaries.push(summary);
+  }
+  return summaries;
 }
 
 // Synthesis query helpers
@@ -170,10 +194,26 @@ export async function getSynthesisQuery(id: number) {
   return result.length > 0 ? result[0] : undefined;
 }
 
+export async function getSynthesisQueriesByUserId(userId: number) {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+  return await db
+    .select()
+    .from(synthesisQueries)
+    .where(eq(synthesisQueries.userId, userId))
+    .orderBy(desc(synthesisQueries.createdAt));
+}
+
 export async function updateSynthesisQueryStatus(id: number, status: "pending" | "processing" | "completed" | "failed") {
   const db = await getDb();
   if (!db) throw new Error("Database not available");
-  await db.update(synthesisQueries).set({ status }).where(eq(synthesisQueries.id, id));
+
+  const updateData: Record<string, unknown> = { status };
+  if (status === "completed" || status === "failed") {
+    updateData.completedAt = new Date();
+  }
+
+  await db.update(synthesisQueries).set(updateData).where(eq(synthesisQueries.id, id));
 }
 
 // Synthesis report helpers
@@ -187,6 +227,17 @@ export async function getSynthesisReport(id: number) {
   const db = await getDb();
   if (!db) throw new Error("Database not available");
   const result = await db.select().from(synthesisReports).where(eq(synthesisReports.id, id)).limit(1);
+  return result.length > 0 ? result[0] : undefined;
+}
+
+export async function getSynthesisReportByQueryId(queryId: number) {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+  const result = await db
+    .select()
+    .from(synthesisReports)
+    .where(eq(synthesisReports.queryId, queryId))
+    .limit(1);
   return result.length > 0 ? result[0] : undefined;
 }
 
@@ -243,6 +294,25 @@ export async function getEntityRelationships(entity1Id: number) {
   return await db.select().from(entityRelationships).where(eq(entityRelationships.entity1Id, entity1Id));
 }
 
+export async function getEntities(limit: number = 200) {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+  return await db.select().from(entities).limit(limit);
+}
+
+export async function getEntityById(id: number) {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+  const result = await db.select().from(entities).where(eq(entities.id, id)).limit(1);
+  return result.length > 0 ? result[0] : undefined;
+}
+
+export async function getAllEntityRelationships(limit: number = 500) {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+  return await db.select().from(entityRelationships).limit(limit);
+}
+
 // Performance metrics helpers
 export async function createPerformanceMetric(metric: InsertPerformanceMetric) {
   const db = await getDb();
@@ -254,4 +324,10 @@ export async function getPerformanceMetrics(metricType: string, limit: number = 
   const db = await getDb();
   if (!db) throw new Error("Database not available");
   return await db.select().from(performanceMetrics).where(eq(performanceMetrics.metricType, metricType)).limit(limit);
+}
+
+export async function getRecentPerformanceMetrics(limit: number = 200) {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+  return await db.select().from(performanceMetrics).orderBy(desc(performanceMetrics.createdAt)).limit(limit);
 }

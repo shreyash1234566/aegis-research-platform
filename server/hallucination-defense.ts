@@ -20,6 +20,35 @@ export interface ClaimVerification {
   contradictingDocuments: number[];
 }
 
+function tokenize(text: string): string[] {
+  return text
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .split(/\s+/)
+    .filter((token) => token.length > 1);
+}
+
+function overlapScore(a: string, b: string): number {
+  const left = new Set(tokenize(a));
+  const right = new Set(tokenize(b));
+  if (left.size === 0 || right.size === 0) {
+    return 0;
+  }
+
+  let overlap = 0;
+  for (const token of Array.from(left)) {
+    if (right.has(token)) {
+      overlap += 1;
+    }
+  }
+
+  return overlap / Math.max(left.size, right.size);
+}
+
+function hasNegation(text: string): boolean {
+  return /\b(no|not|never|none|cannot|without|lack|fails?)\b/i.test(text);
+}
+
 /**
  * LAYER 1: MEGA-RAG Multi-Source Retrieval
  * Already implemented in retrieval.ts
@@ -40,21 +69,14 @@ export async function cragGating(
   cleanedChunk?: string;
 }> {
   try {
-    // TODO: Implement T5-large evaluator
-    // This would involve:
-    // 1. Loading T5-large model
-    // 2. Scoring chunk relevance to query
-    // 3. Returning verdict and score
-
-    // For now, return placeholder
-    const score = Math.random();
+    const score = overlapScore(query, chunk);
     let verdict: "correct" | "incorrect" | "ambiguous" = "ambiguous";
-    if (score > 0.7) verdict = "correct";
-    else if (score < 0.3) verdict = "incorrect";
+    if (score >= 0.35) verdict = "correct";
+    else if (score < 0.12) verdict = "incorrect";
 
     return {
       verdict,
-      score,
+      score: Number(score.toFixed(4)),
       cleanedChunk: chunk,
     };
   } catch (error) {
@@ -83,18 +105,47 @@ export async function selfRagSynthesis(
   retrievalCycles: number;
 }> {
   try {
-    // TODO: Implement Self-RAG synthesis
-    // This would involve:
-    // 1. Generating text with reflection tokens
-    // 2. Dynamically deciding when to retrieve
-    // 3. Evaluating retrieved relevance
-    // 4. Verifying support for claims
-    // 5. Assessing section utility
+    const topEvidence = evidence.slice(0, 4);
+
+    if (topEvidence.length === 0) {
+      return {
+        synthesis: "No grounded evidence was retrieved for this query.",
+        reflections: [
+          {
+            retrieve: true,
+            isRel: false,
+            isSupp: false,
+            isUse: false,
+          },
+        ],
+        retrievalCycles: 1,
+      };
+    }
+
+    const reflections = topEvidence.map((item) => {
+      const relevance = overlapScore(query, item.text);
+      return {
+        retrieve: relevance < 0.18,
+        isRel: relevance >= 0.18,
+        isSupp: item.aggregatedScore >= 0.25,
+        isUse: item.aggregatedScore >= 0.18,
+      };
+    });
+
+    const synthesisLines = topEvidence.map(
+      (item, index) =>
+        `${index + 1}. [Doc ${item.documentId}] ${item.text.slice(0, 260).trim()}`
+    );
 
     return {
-      synthesis: "",
-      reflections: [],
-      retrievalCycles: 0,
+      synthesis: [
+        `Grounded synthesis for: ${query}`,
+        "",
+        "Evidence-backed findings:",
+        ...synthesisLines,
+      ].join("\n"),
+      reflections,
+      retrievalCycles: reflections.some((item) => item.retrieve) ? 2 : 1,
     };
   } catch (error) {
     console.error("Self-RAG synthesis failed:", error);
@@ -116,22 +167,22 @@ export async function documentTrustClassifier(
   recommendation: "use_rag" | "use_parametric" | "explicit_uncertainty";
 }> {
   try {
-    // TODO: Implement trust classifier
-    // This would involve:
-    // 1. Evaluating source reliability
-    // 2. Checking chunk relevance
-    // 3. Assessing recency
-    // 4. Computing trust score
+    const relevance = overlapScore(query, chunk);
+    const recencyBoost =
+      document?.processedAt && !Number.isNaN(new Date(document.processedAt).getTime())
+        ? 0.1
+        : 0;
+    const statusBoost = document?.status === "completed" ? 0.15 : 0;
+    const trustScore = Math.min(1, relevance * 0.7 + recencyBoost + statusBoost + 0.1);
 
-    const trustScore = Math.random();
     let reliability: "high" | "medium" | "low" = "medium";
     let recommendation: "use_rag" | "use_parametric" | "explicit_uncertainty" =
       "explicit_uncertainty";
 
-    if (trustScore > 0.7) {
+    if (trustScore > 0.72) {
       reliability = "high";
       recommendation = "use_rag";
-    } else if (trustScore < 0.4) {
+    } else if (trustScore < 0.3) {
       reliability = "low";
       recommendation = "explicit_uncertainty";
     } else {
@@ -139,7 +190,7 @@ export async function documentTrustClassifier(
     }
 
     return {
-      trustScore,
+      trustScore: Number(trustScore.toFixed(4)),
       reliability,
       recommendation,
     };
@@ -201,9 +252,15 @@ function findGroundingChunks(
   claim: string,
   evidence: AggregatedResult[]
 ): AggregatedResult[] {
-  // TODO: Implement semantic matching between claim and chunks
-  // For now, return top evidence chunks
-  return evidence.slice(0, 3);
+  return [...evidence]
+    .map((item) => ({
+      item,
+      score: overlapScore(claim, item.text),
+    }))
+    .filter(({ score }) => score >= 0.08)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 3)
+    .map(({ item }) => item);
 }
 
 /**
@@ -214,12 +271,17 @@ function detectContradictions(
   evidence: AggregatedResult[],
   documents: any[]
 ): AggregatedResult[] {
-  // TODO: Implement contradiction detection
-  // This would involve:
-  // 1. Extracting key entities and relationships from claim
-  // 2. Finding contradictory statements in evidence
-  // 3. Comparing with other documents
-  return [];
+  const claimNegation = hasNegation(claim);
+
+  return evidence.filter((item) => {
+    const sharedTerms = overlapScore(claim, item.text);
+    if (sharedTerms < 0.15) {
+      return false;
+    }
+
+    const evidenceNegation = hasNegation(item.text);
+    return claimNegation !== evidenceNegation;
+  });
 }
 
 /**
@@ -256,18 +318,40 @@ export async function deepseekR1Verification(
   correctedClaims: ClaimVerification[];
 }> {
   try {
-    // TODO: Implement DeepSeek-R1 reasoning verification
-    // This would involve:
-    // 1. Loading DeepSeek-R1 model
-    // 2. Performing chain-of-thought reasoning
-    // 3. Self-verifying the synthesis
-    // 4. Correcting logic-based hallucinations
-    // 5. Re-reasoning around contradictions
+    const correctedClaims = claims.map((claim) => {
+      if (claim.confidenceTier !== "low") {
+        return claim;
+      }
+
+      const strongerGrounding = evidence
+        .filter((item) => overlapScore(claim.claim, item.text) >= 0.2)
+        .slice(0, 2)
+        .map((item) => item.chunkId);
+
+      if (strongerGrounding.length > claim.grounding.length) {
+        return {
+          ...claim,
+          grounding: strongerGrounding,
+          confidenceTier: "medium" as const,
+        };
+      }
+
+      return claim;
+    });
+
+    const lowConfidenceCount = correctedClaims.filter(
+      (claim) => claim.confidenceTier === "low"
+    ).length;
+
+    const finalSynthesis =
+      lowConfidenceCount > 0
+        ? `${synthesis}\n\nVerification note: ${lowConfidenceCount} claim(s) remain low confidence and should be treated as tentative.`
+        : synthesis;
 
     return {
-      finalSynthesis: synthesis,
-      reasoning: "",
-      correctedClaims: claims,
+      finalSynthesis,
+      reasoning: `Verified ${correctedClaims.length} claims against ${evidence.length} evidence chunks.`,
+      correctedClaims,
     };
   } catch (error) {
     console.error("DeepSeek-R1 verification failed:", error);
@@ -331,9 +415,11 @@ export async function completeHallucinationDefense(
  * Extract claims from synthesis text
  */
 function extractClaims(synthesis: string): string[] {
-  // TODO: Implement claim extraction
-  // This could use sentence tokenization and NLP
-  return synthesis.split(".").filter((s) => s.trim().length > 0);
+  return synthesis
+    .split(/\n|\.|\?|!/) 
+    .map((line) => line.replace(/^[-*\d\s.]+/, "").trim())
+    .filter((line) => line.length > 20)
+    .slice(0, 12);
 }
 
 /**

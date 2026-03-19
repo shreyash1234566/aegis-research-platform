@@ -1,26 +1,57 @@
 import { useState } from "react";
-import { useAuth } from "@/_core/hooks/useAuth";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Upload, FileText, Loader2 } from "lucide-react";
 import { trpc } from "@/lib/trpc";
 import { toast } from "sonner";
+import { Streamdown } from "streamdown";
+
+async function fileToBase64(file: File): Promise<string> {
+  return await new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = typeof reader.result === "string" ? reader.result : "";
+      const base64 = result.includes(",") ? result.split(",")[1] : result;
+      if (!base64) {
+        reject(new Error("Failed to encode file"));
+        return;
+      }
+      resolve(base64);
+    };
+    reader.onerror = () => reject(reader.error ?? new Error("File read failed"));
+    reader.readAsDataURL(file);
+  });
+}
 
 export default function Documents() {
-  const { user } = useAuth();
   const [uploading, setUploading] = useState(false);
+  const [selectedSummaryDocumentId, setSelectedSummaryDocumentId] = useState<number | null>(null);
 
   // Fetch documents
-  const { data: documents, isLoading, refetch } = trpc.documents.list.useQuery();
+  const {
+    data: documents,
+    isLoading,
+    refetch,
+  } = trpc.documents.list.useQuery(undefined, {
+    refetchInterval: 2500,
+  });
+
+  const summaryQuery = trpc.documents.getSummary.useQuery(
+    { documentId: selectedSummaryDocumentId ?? 0 },
+    {
+      enabled: selectedSummaryDocumentId !== null,
+      retry: false,
+    }
+  );
 
   // Upload mutation
-  const uploadMutation = trpc.documents.getUploadUrl.useMutation({
-    onSuccess: (data) => {
-      toast.success("Document uploaded successfully");
+  const uploadMutation = trpc.documents.upload.useMutation({
+    onSuccess: () => {
+      toast.success("Document uploaded and queued for processing");
       refetch();
     },
     onError: (error) => {
-      toast.error("Failed to upload document");
+      toast.error(error.message || "Failed to upload document");
       console.error(error);
     },
   });
@@ -31,28 +62,23 @@ export default function Documents() {
 
     setUploading(true);
     try {
-      // Get upload URL
-      const uploadData = await uploadMutation.mutateAsync({
+      const base64Content = await fileToBase64(file);
+      await uploadMutation.mutateAsync({
         fileName: file.name,
         fileSize: file.size,
-        mimeType: file.type,
+        mimeType: file.type || "application/octet-stream",
+        base64Content,
       });
-
-      // In a real implementation, upload to S3 here
-      console.log("Upload URL:", uploadData.uploadUrl);
-
-      // Mark as processed
-      // await markProcessedMutation.mutateAsync({
-      //   documentId: uploadData.documentId,
-      //   s3Url: uploadData.uploadUrl,
-      // });
     } catch (error) {
       console.error("Upload failed:", error);
       toast.error("Upload failed");
     } finally {
       setUploading(false);
+      event.target.value = "";
     }
   };
+
+  const selectedSummary = summaryQuery.data;
 
   return (
     <div className="min-h-screen bg-background">
@@ -135,9 +161,19 @@ export default function Documents() {
                             ⟳ Processing...
                           </p>
                         )}
+                        {doc.status === "failed" && (
+                          <p className="text-xs text-red-600 mt-1">
+                            ✗ Processing failed
+                          </p>
+                        )}
                       </div>
                     </div>
-                    <Button variant="outline" size="sm">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => setSelectedSummaryDocumentId(doc.id)}
+                      disabled={doc.status !== "completed"}
+                    >
                       View Summary
                     </Button>
                   </div>
@@ -154,6 +190,41 @@ export default function Documents() {
             </Card>
           )}
         </div>
+
+        {selectedSummaryDocumentId !== null && (
+          <Card className="p-6 mt-8">
+            <h2 className="text-xl font-semibold mb-3">
+              Document Summary: #{selectedSummaryDocumentId}
+            </h2>
+
+            {summaryQuery.isLoading ? (
+              <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                <Loader2 className="w-4 h-4 animate-spin" />
+                Loading summary...
+              </div>
+            ) : summaryQuery.error ? (
+              <p className="text-sm text-red-600">{summaryQuery.error.message}</p>
+            ) : selectedSummary ? (
+              <div className="space-y-4">
+                <div>
+                  <h3 className="font-semibold mb-2">Summary</h3>
+                  <Streamdown>{selectedSummary.summary || "No summary available."}</Streamdown>
+                </div>
+
+                <div>
+                  <h3 className="font-semibold mb-2">Key Claims</h3>
+                  <pre className="text-xs bg-muted rounded p-3 overflow-auto">
+                    {JSON.stringify(selectedSummary.keyClaims, null, 2)}
+                  </pre>
+                </div>
+              </div>
+            ) : (
+              <p className="text-sm text-muted-foreground">
+                No summary found for this document yet.
+              </p>
+            )}
+          </Card>
+        )}
       </div>
     </div>
   );

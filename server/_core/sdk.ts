@@ -39,8 +39,14 @@ class OAuthService {
   }
 
   private decodeState(state: string): string {
-    const redirectUri = atob(state);
-    return redirectUri;
+    try {
+      const normalized = state.replace(/-/g, "+").replace(/_/g, "/");
+      const padding = (4 - (normalized.length % 4)) % 4;
+      const padded = normalized + "=".repeat(padding);
+      return Buffer.from(padded, "base64").toString("utf-8");
+    } catch {
+      throw new Error("Invalid OAuth state payload");
+    }
   }
 
   async getTokenByCode(

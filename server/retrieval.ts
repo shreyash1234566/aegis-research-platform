@@ -6,8 +6,6 @@
  * - GraphRAG knowledge graph queries
  */
 
-import { createPerformanceMetric } from "./db";
-
 export interface RetrievalSource {
   type: "vector" | "bm25" | "graphrag";
   score: number;
@@ -27,20 +25,112 @@ export interface AggregatedResult {
   trustScore?: number;
 }
 
+export interface CorpusChunk {
+  chunkId: string;
+  documentId: number;
+  text: string;
+  entities?: string[];
+}
+
+function tokenize(text: string): string[] {
+  return text
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .split(/\s+/)
+    .filter((token) => token.length > 1);
+}
+
+function termFrequency(tokens: string[]): Map<string, number> {
+  const freq = new Map<string, number>();
+  for (const token of tokens) {
+    freq.set(token, (freq.get(token) ?? 0) + 1);
+  }
+  return freq;
+}
+
+function cosineSimilarity(a: Map<string, number>, b: Map<string, number>): number {
+  const keys = new Set<string>([
+    ...Array.from(a.keys()),
+    ...Array.from(b.keys()),
+  ]);
+  let dot = 0;
+  let normA = 0;
+  let normB = 0;
+
+  for (const key of Array.from(keys)) {
+    const av = a.get(key) ?? 0;
+    const bv = b.get(key) ?? 0;
+    dot += av * bv;
+    normA += av * av;
+    normB += bv * bv;
+  }
+
+  if (normA === 0 || normB === 0) {
+    return 0;
+  }
+
+  return dot / (Math.sqrt(normA) * Math.sqrt(normB));
+}
+
+function lexicalOverlap(a: string, b: string): number {
+  const aTokens = new Set(tokenize(a));
+  const bTokens = new Set(tokenize(b));
+  if (aTokens.size === 0 || bTokens.size === 0) {
+    return 0;
+  }
+
+  let overlap = 0;
+  for (const token of Array.from(aTokens)) {
+    if (bTokens.has(token)) {
+      overlap += 1;
+    }
+  }
+
+  return overlap / Math.max(aTokens.size, bTokens.size);
+}
+
+function normalizeTopK<T extends { score: number }>(items: T[], topK: number): T[] {
+  const sorted = [...items].sort((a, b) => b.score - a.score).slice(0, topK);
+  if (sorted.length === 0) {
+    return sorted;
+  }
+
+  const max = sorted[0].score || 1;
+  return sorted.map((item) => ({
+    ...item,
+    score: Number((item.score / max).toFixed(4)),
+  }));
+}
+
+function inferQueryEntities(query: string): string[] {
+  const rawTokens = query
+    .replace(/[^a-zA-Z0-9\s]/g, " ")
+    .split(/\s+/)
+    .filter((token) => token.length > 3);
+
+  const unique = new Set(rawTokens.map((token) => token.toLowerCase()));
+  return Array.from(unique);
+}
+
 /**
  * Module 1: Multi-Source Evidence Retrieval (MSER)
  * Aggregates evidence from three parallel retrieval systems
  */
 export async function multiSourceRetrieval(
   query: string,
-  topK: number = 10
+  topK: number = 10,
+  corpus: CorpusChunk[] = []
 ): Promise<AggregatedResult[]> {
   try {
+    if (corpus.length === 0) {
+      return [];
+    }
+
     // Parallel retrieval from all three sources
     const [vectorResults, bm25Results, graphragResults] = await Promise.all([
-      vectorSearch(query, topK),
-      bm25Search(query, topK),
-      graphragSearch(query, topK),
+      vectorSearch(query, topK, corpus),
+      bm25Search(query, topK, corpus),
+      graphragSearch(query, topK, corpus),
     ]);
 
     // Aggregate results
@@ -99,6 +189,11 @@ export async function multiSourceRetrieval(
 
     // Sort by aggregated score and return top-K
     return Array.from(aggregated.values())
+      .map((result) => ({
+        ...result,
+        cragScore: Number(Math.min(1, result.aggregatedScore * 1.1).toFixed(4)),
+        trustScore: Number(Math.min(1, 0.45 + result.sources.length * 0.18).toFixed(4)),
+      }))
       .sort((a, b) => b.aggregatedScore - a.aggregatedScore)
       .slice(0, topK);
   } catch (error) {
@@ -113,16 +208,23 @@ export async function multiSourceRetrieval(
  */
 async function vectorSearch(
   query: string,
-  topK: number
+  topK: number,
+  corpus: CorpusChunk[]
 ): Promise<RetrievalSource[]> {
   try {
-    // TODO: Implement HNSW vector search
-    // This would typically involve:
-    // 1. Embedding the query using mE5-large-instruct
-    // 2. Querying the HNSW index
-    // 3. Retrieving the top-K similar chunks
-    console.log(`[Vector Search] Query: ${query}, TopK: ${topK}`);
-    return [];
+    const queryTf = termFrequency(tokenize(query));
+    const scored = corpus.map((chunk) => {
+      const score = cosineSimilarity(queryTf, termFrequency(tokenize(chunk.text)));
+      return {
+        type: "vector" as const,
+        score,
+        chunkId: chunk.chunkId,
+        documentId: chunk.documentId,
+        text: chunk.text,
+      };
+    });
+
+    return normalizeTopK(scored.filter((item) => item.score > 0), topK);
   } catch (error) {
     console.error("Vector search failed:", error);
     return [];
@@ -135,16 +237,60 @@ async function vectorSearch(
  */
 async function bm25Search(
   query: string,
-  topK: number
+  topK: number,
+  corpus: CorpusChunk[]
 ): Promise<RetrievalSource[]> {
   try {
-    // TODO: Implement BM25 search
-    // This would typically involve:
-    // 1. Tokenizing the query
-    // 2. Searching the BM25 index
-    // 3. Ranking results by relevance
-    console.log(`[BM25 Search] Query: ${query}, TopK: ${topK}`);
-    return [];
+    const queryTokens = tokenize(query);
+    const uniqueQueryTokens = Array.from(new Set(queryTokens));
+    if (uniqueQueryTokens.length === 0) {
+      return [];
+    }
+
+    const chunkTokens = corpus.map((chunk) => tokenize(chunk.text));
+    const avgDocLength =
+      chunkTokens.reduce((sum, tokens) => sum + tokens.length, 0) /
+      Math.max(chunkTokens.length, 1);
+
+    const documentFrequencies = new Map<string, number>();
+    for (const token of uniqueQueryTokens) {
+      const df = chunkTokens.reduce(
+        (count, tokens) => (tokens.includes(token) ? count + 1 : count),
+        0
+      );
+      documentFrequencies.set(token, df);
+    }
+
+    const k1 = 1.5;
+    const b = 0.75;
+
+    const scored = corpus.map((chunk, index) => {
+      const tokens = chunkTokens[index];
+      const tf = termFrequency(tokens);
+      const docLength = tokens.length || 1;
+
+      let score = 0;
+      for (const token of uniqueQueryTokens) {
+        const tokenTf = tf.get(token) ?? 0;
+        if (tokenTf === 0) continue;
+
+        const df = documentFrequencies.get(token) ?? 0;
+        const idf = Math.log(1 + (corpus.length - df + 0.5) / (df + 0.5));
+        const numerator = tokenTf * (k1 + 1);
+        const denominator = tokenTf + k1 * (1 - b + (b * docLength) / avgDocLength);
+        score += idf * (numerator / denominator);
+      }
+
+      return {
+        type: "bm25" as const,
+        score,
+        chunkId: chunk.chunkId,
+        documentId: chunk.documentId,
+        text: chunk.text,
+      };
+    });
+
+    return normalizeTopK(scored.filter((item) => item.score > 0), topK);
   } catch (error) {
     console.error("BM25 search failed:", error);
     return [];
@@ -157,16 +303,40 @@ async function bm25Search(
  */
 async function graphragSearch(
   query: string,
-  topK: number
+  topK: number,
+  corpus: CorpusChunk[]
 ): Promise<RetrievalSource[]> {
   try {
-    // TODO: Implement GraphRAG search
-    // This would typically involve:
-    // 1. Extracting entities and relationships from the query
-    // 2. Querying the knowledge graph
-    // 3. Retrieving relevant community summaries
-    console.log(`[GraphRAG Search] Query: ${query}, TopK: ${topK}`);
-    return [];
+    const queryEntities = inferQueryEntities(query);
+    if (queryEntities.length === 0) {
+      return [];
+    }
+
+    const scored = corpus.map((chunk) => {
+      const entityTokens =
+        chunk.entities && chunk.entities.length > 0
+          ? chunk.entities.map((entity) => entity.toLowerCase())
+          : tokenize(chunk.text).filter((token) => token.length > 5);
+
+      const entitySet = new Set(entityTokens);
+      let overlap = 0;
+      for (const queryEntity of queryEntities) {
+        if (entitySet.has(queryEntity)) {
+          overlap += 1;
+        }
+      }
+
+      const score = overlap / queryEntities.length;
+      return {
+        type: "graphrag" as const,
+        score,
+        chunkId: chunk.chunkId,
+        documentId: chunk.documentId,
+        text: chunk.text,
+      };
+    });
+
+    return normalizeTopK(scored.filter((item) => item.score > 0), topK);
   } catch (error) {
     console.error("GraphRAG search failed:", error);
     return [];
@@ -188,13 +358,62 @@ export async function generateCandidateAnswers(
   retrievedEvidence: AggregatedResult[]
 ): Promise<CandidateAnswer[]> {
   try {
-    // TODO: Implement candidate answer generation
-    // This would involve calling an LLM with different temperatures
-    // and prompt variants to generate diverse answers
-    console.log(
-      `[DPAG] Generating candidates for query: ${query}`
-    );
-    return [];
+    if (retrievedEvidence.length === 0) {
+      return [
+        {
+          text: "Insufficient evidence was retrieved to produce a grounded synthesis.",
+          temperature: 0,
+          relevanceScore: 0,
+        },
+      ];
+    }
+
+    const topEvidence = retrievedEvidence
+      .slice(0, 3)
+      .map(
+        (item, index) =>
+          `${index + 1}. [Doc ${item.documentId}] ${item.text.slice(0, 220).trim()}`
+      )
+      .join("\n");
+
+    const bestScore = retrievedEvidence[0]?.aggregatedScore ?? 0;
+    const medianScore =
+      retrievedEvidence[Math.floor(retrievedEvidence.length / 2)]?.aggregatedScore ?? bestScore;
+
+    return [
+      {
+        text: [
+          `Evidence-driven synthesis for: ${query}`,
+          "",
+          "Top supporting evidence:",
+          topEvidence,
+        ].join("\n"),
+        temperature: 0.2,
+        relevanceScore: Number(bestScore.toFixed(4)),
+      },
+      {
+        text: [
+          `Cross-source interpretation for: ${query}`,
+          "",
+          "The strongest evidence converges on these points:",
+          topEvidence,
+        ].join("\n"),
+        temperature: 0.5,
+        relevanceScore: Number(((bestScore + medianScore) / 2).toFixed(4)),
+      },
+      {
+        text: [
+          `Conservative synthesis for: ${query}`,
+          "",
+          "Only strongly grounded observations are included:",
+          topEvidence,
+          "",
+          "If additional source quality is required, run a narrower follow-up query.",
+        ].join("\n"),
+        temperature: 0.1,
+        relevanceScore: Number((medianScore * 0.9).toFixed(4)),
+      },
+    ];
   } catch (error) {
     console.error("Candidate answer generation failed:", error);
     throw error;
@@ -210,13 +429,14 @@ export async function evaluateAlignmentWithEvidence(
   evidence: AggregatedResult[]
 ): Promise<number> {
   try {
-    // TODO: Implement alignment evaluation
-    // This would involve:
-    // 1. Computing cosine similarity between answer and evidence
-    // 2. Computing BERTScore alignment
-    // 3. Returning alignment score (0-1)
-    console.log(`[SEAE] Evaluating alignment for answer: ${answer.substring(0, 50)}...`);
-    return 0.85; // Placeholder score
+    if (evidence.length === 0 || answer.trim().length === 0) {
+      return 0;
+    }
+
+    const concatenatedEvidence = evidence.map((item) => item.text).join("\n");
+    const overlap = lexicalOverlap(answer, concatenatedEvidence);
+    const coverage = Math.min(1, evidence.length / 5);
+    return Number((overlap * 0.75 + coverage * 0.25).toFixed(4));
   } catch (error) {
     console.error("Alignment evaluation failed:", error);
     throw error;
@@ -232,14 +452,38 @@ export async function detectAndResolveDiscrepancies(
   evidence: AggregatedResult[]
 ): Promise<string> {
   try {
-    // TODO: Implement discrepancy detection and resolution
-    // This would involve:
-    // 1. Detecting contradictions between candidates
-    // 2. Detecting contradictions with evidence
-    // 3. Triggering secondary retrieval for conflicting topics
-    // 4. Using knowledge-guided editing to resolve conflicts
-    console.log(`[DISC] Detecting discrepancies in ${candidates.length} candidates`);
-    return candidates[0]?.text || "";
+    if (candidates.length === 0) {
+      return "No candidate answers were generated.";
+    }
+
+    const scoredCandidates = await Promise.all(
+      candidates.map(async (candidate) => {
+        const alignment = await evaluateAlignmentWithEvidence(candidate.text, evidence);
+        const score = candidate.relevanceScore * 0.6 + alignment * 0.4;
+        return {
+          candidate,
+          alignment,
+          score,
+        };
+      })
+    );
+
+    scoredCandidates.sort((a, b) => b.score - a.score);
+    const best = scoredCandidates[0];
+
+    if (!best || best.alignment < 0.2) {
+      const topEvidence = evidence
+        .slice(0, 2)
+        .map((item) => `[Doc ${item.documentId}] ${item.text.slice(0, 180).trim()}`)
+        .join("\n");
+      return [
+        "Evidence is currently too weak to provide a high-confidence synthesis.",
+        "Most relevant excerpts:",
+        topEvidence || "No supporting excerpts available.",
+      ].join("\n\n");
+    }
+
+    return best.candidate.text;
   } catch (error) {
     console.error("Discrepancy resolution failed:", error);
     throw error;
@@ -251,7 +495,8 @@ export async function detectAndResolveDiscrepancies(
  */
 export async function megaRagPipeline(
   query: string,
-  topK: number = 10
+  topK: number = 10,
+  corpus: CorpusChunk[] = []
 ): Promise<{
   answer: string;
   evidence: AggregatedResult[];
@@ -260,7 +505,7 @@ export async function megaRagPipeline(
 }> {
   try {
     // Module 1: Multi-source retrieval
-    const evidence = await multiSourceRetrieval(query, topK);
+    const evidence = await multiSourceRetrieval(query, topK, corpus);
 
     // Module 2: Generate diverse candidates
     const candidates = await generateCandidateAnswers(query, evidence);
@@ -283,7 +528,9 @@ export async function megaRagPipeline(
       answer: finalAnswer,
       evidence,
       alignmentScore: bestScore,
-      contradictions: [], // TODO: Extract contradictions
+      contradictions: candidates.length > 1 && bestScore < 0.35
+        ? ["Candidate agreement is low; synthesis confidence is reduced."]
+        : [],
     };
   } catch (error) {
     console.error("MEGA-RAG pipeline failed:", error);

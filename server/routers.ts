@@ -2,7 +2,9 @@ import { COOKIE_NAME } from "@shared/const";
 import { getSessionCookieOptions } from "./_core/cookies";
 import { systemRouter } from "./_core/systemRouter";
 import { publicProcedure, router } from "./_core/trpc";
+import { analyticsRouter } from "./routers/analytics";
 import { documentsRouter } from "./routers/documents";
+import { graphRouter } from "./routers/graph";
 import { synthesisRouter } from "./routers/synthesis";
 
 export const appRouter = router({
@@ -19,6 +21,8 @@ export const appRouter = router({
   }),
   documents: documentsRouter,
   synthesis: synthesisRouter,
+  graph: graphRouter,
+  analytics: analyticsRouter,
 });
 
 export type AppRouter = typeof appRouter;

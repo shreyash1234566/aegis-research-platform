@@ -82,7 +82,11 @@ export default function Home() {
 
             <Button
               size="lg"
-              onClick={() => window.location.href = getLoginUrl()}
+              onClick={() => {
+                const loginUrl = getLoginUrl();
+                if (!loginUrl) return;
+                window.location.href = loginUrl;
+              }}
               className="bg-blue-600 hover:bg-blue-700 text-white px-8 py-6 text-lg"
             >
               Sign In to Get Started
@@ -106,7 +110,7 @@ export default function Home() {
         </div>
 
         {/* Quick Actions */}
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6 mb-12">
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-12">
           <Card className="p-6 hover:shadow-lg transition-shadow cursor-pointer" onClick={() => setLocation("/documents")}>
             <FileText className="w-8 h-8 text-blue-500 mb-3" />
             <h3 className="font-semibold mb-2">Upload Documents</h3>
@@ -129,14 +133,25 @@ export default function Home() {
             </Button>
           </Card>
 
-          <Card className="p-6 hover:shadow-lg transition-shadow cursor-pointer">
+          <Card className="p-6 hover:shadow-lg transition-shadow cursor-pointer" onClick={() => setLocation("/analytics")}>
             <BarChart3 className="w-8 h-8 text-purple-500 mb-3" />
             <h3 className="font-semibold mb-2">Analytics Dashboard</h3>
             <p className="text-sm text-muted-foreground mb-4">
               Monitor hallucination rates and retrieval quality metrics
             </p>
-            <Button variant="outline" size="sm" disabled>
-              Coming Soon
+            <Button variant="outline" size="sm">
+              Open Analytics
+            </Button>
+          </Card>
+
+          <Card className="p-6 hover:shadow-lg transition-shadow cursor-pointer" onClick={() => setLocation("/graph")}>
+            <Brain className="w-8 h-8 text-indigo-500 mb-3" />
+            <h3 className="font-semibold mb-2">Knowledge Graph</h3>
+            <p className="text-sm text-muted-foreground mb-4">
+              Inspect extracted entities and cross-document relationships
+            </p>
+            <Button variant="outline" size="sm">
+              Open Graph
             </Button>
           </Card>
         </div>

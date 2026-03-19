@@ -1,14 +1,44 @@
 import { z } from "zod";
 import { protectedProcedure, router } from "../_core/trpc";
 import {
+  createPerformanceMetric,
   createDocument,
+  deleteDocumentById,
   getDocumentsByUserId,
   getDocumentById,
-  updateDocumentStatus,
+  updateDocumentFields,
   getDocumentSummary,
 } from "../db";
 import { storagePut } from "../storage";
 import { TRPCError } from "@trpc/server";
+import { enqueueDocumentProcessingJob } from "../jobs/documentWorker";
+
+const MAX_UPLOAD_BYTES = 15 * 1024 * 1024;
+
+function createDocumentKey(userId: number, fileName: string): string {
+  const timestamp = Date.now();
+  const randomSuffix = Math.random().toString(36).substring(2, 8);
+  const safeName = fileName.replace(/[^a-zA-Z0-9._-]/g, "_");
+  return `documents/${userId}/${timestamp}-${randomSuffix}-${safeName}`;
+}
+
+function extractDocumentText(
+  data: Buffer,
+  mimeType: string,
+  fileName: string
+): string {
+  const textExtensions = /\.(txt|md|markdown|csv|json|xml|html)$/i;
+  const isTextLike = mimeType.startsWith("text/") || textExtensions.test(fileName);
+
+  if (isTextLike) {
+    return data.toString("utf-8");
+  }
+
+  return [
+    `Document '${fileName}' uploaded as ${mimeType || "application/octet-stream"}.`,
+    "Binary content parsing is limited in this build, so extraction uses metadata and filename context.",
+  ].join(" ");
+}
 
 export const documentsRouter = router({
   // Get all documents for the current user
@@ -18,6 +48,9 @@ export const documentsRouter = router({
       return docs;
     } catch (error) {
       console.error("Failed to list documents:", error);
+      if (error instanceof TRPCError) {
+        throw error;
+      }
       throw new TRPCError({
         code: "INTERNAL_SERVER_ERROR",
         message: "Failed to list documents",
@@ -47,6 +80,9 @@ export const documentsRouter = router({
         return doc;
       } catch (error) {
         console.error("Failed to get document:", error);
+        if (error instanceof TRPCError) {
+          throw error;
+        }
         throw new TRPCError({
           code: "INTERNAL_SERVER_ERROR",
           message: "Failed to get document",
@@ -70,6 +106,9 @@ export const documentsRouter = router({
         return summary || null;
       } catch (error) {
         console.error("Failed to get document summary:", error);
+        if (error instanceof TRPCError) {
+          throw error;
+        }
         throw new TRPCError({
           code: "INTERNAL_SERVER_ERROR",
           message: "Failed to get document summary",
@@ -88,10 +127,7 @@ export const documentsRouter = router({
     )
     .mutation(async ({ ctx, input }) => {
       try {
-        // Generate a unique key for the document
-        const timestamp = Date.now();
-        const randomSuffix = Math.random().toString(36).substring(2, 8);
-        const s3Key = `documents/${ctx.user.id}/${timestamp}-${randomSuffix}-${input.fileName}`;
+        const s3Key = createDocumentKey(ctx.user.id, input.fileName);
 
         // Store document metadata in database
         const doc = await createDocument({
@@ -112,9 +148,98 @@ export const documentsRouter = router({
         };
       } catch (error) {
         console.error("Failed to get upload URL:", error);
+        if (error instanceof TRPCError) {
+          throw error;
+        }
         throw new TRPCError({
           code: "INTERNAL_SERVER_ERROR",
           message: "Failed to get upload URL",
+        });
+      }
+    }),
+
+  // Direct upload endpoint for end-to-end ingestion and processing.
+  upload: protectedProcedure
+    .input(
+      z.object({
+        fileName: z.string().min(1).max(255),
+        fileSize: z.number().int().positive(),
+        mimeType: z.string().min(1).max(100),
+        base64Content: z.string().min(1),
+        title: z.string().max(255).optional(),
+        description: z.string().max(5000).optional(),
+      })
+    )
+    .mutation(async ({ ctx, input }) => {
+      try {
+        if (input.fileSize > MAX_UPLOAD_BYTES) {
+          throw new TRPCError({
+            code: "BAD_REQUEST",
+            message: `File size exceeds ${MAX_UPLOAD_BYTES / (1024 * 1024)}MB limit`,
+          });
+        }
+
+        const normalizedBase64 = input.base64Content.replace(/^data:.*;base64,/, "");
+        const fileBuffer = Buffer.from(normalizedBase64, "base64");
+
+        if (fileBuffer.length === 0) {
+          throw new TRPCError({
+            code: "BAD_REQUEST",
+            message: "Uploaded file is empty",
+          });
+        }
+
+        const s3Key = createDocumentKey(ctx.user.id, input.fileName);
+        const uploadResult = await storagePut(s3Key, fileBuffer, input.mimeType);
+
+        const createResult = await createDocument({
+          userId: ctx.user.id,
+          title: input.title || input.fileName,
+          description: input.description || null,
+          fileName: input.fileName,
+          s3Key,
+          s3Url: uploadResult.url,
+          mimeType: input.mimeType,
+          fileSize: input.fileSize,
+          status: "processing",
+        });
+
+        const documentId = Number((createResult as { insertId?: number }).insertId);
+        if (!Number.isFinite(documentId)) {
+          throw new TRPCError({
+            code: "INTERNAL_SERVER_ERROR",
+            message: "Failed to persist document metadata",
+          });
+        }
+
+        const documentText = extractDocumentText(fileBuffer, input.mimeType, input.fileName);
+        enqueueDocumentProcessingJob({
+          documentId,
+          userId: ctx.user.id,
+          documentText,
+        });
+
+        await createPerformanceMetric({
+          metricType: "user_document_upload_count",
+          value: 1 as any,
+          queryId: null,
+          reportId: null,
+        });
+
+        return {
+          documentId,
+          s3Key,
+          s3Url: uploadResult.url,
+          status: "processing" as const,
+        };
+      } catch (error) {
+        console.error("Failed to upload document:", error);
+        if (error instanceof TRPCError) {
+          throw error;
+        }
+        throw new TRPCError({
+          code: "INTERNAL_SERVER_ERROR",
+          message: "Failed to upload document",
         });
       }
     }),
@@ -138,12 +263,18 @@ export const documentsRouter = router({
           });
         }
 
-        // Update document status to processing
-        await updateDocumentStatus(input.documentId, "processing");
+        await updateDocumentFields(input.documentId, {
+          status: "processing",
+          s3Url: input.s3Url,
+          tokenCount: input.tokenCount,
+        });
 
         return { success: true };
       } catch (error) {
         console.error("Failed to mark document as processed:", error);
+        if (error instanceof TRPCError) {
+          throw error;
+        }
         throw new TRPCError({
           code: "INTERNAL_SERVER_ERROR",
           message: "Failed to mark document as processed",
@@ -170,12 +301,19 @@ export const documentsRouter = router({
           });
         }
 
-        // Update document in database
-        // TODO: Implement update logic
+        await updateDocumentFields(input.documentId, {
+          ...(input.title !== undefined ? { title: input.title } : {}),
+          ...(input.description !== undefined
+            ? { description: input.description }
+            : {}),
+        });
 
         return { success: true };
       } catch (error) {
         console.error("Failed to update document:", error);
+        if (error instanceof TRPCError) {
+          throw error;
+        }
         throw new TRPCError({
           code: "INTERNAL_SERVER_ERROR",
           message: "Failed to update document",
@@ -196,12 +334,15 @@ export const documentsRouter = router({
           });
         }
 
-        // Delete from S3 and database
-        // TODO: Implement delete logic
+        // Storage delete endpoint is not currently exposed; metadata is removed first.
+        await deleteDocumentById(input.documentId);
 
         return { success: true };
       } catch (error) {
         console.error("Failed to delete document:", error);
+        if (error instanceof TRPCError) {
+          throw error;
+        }
         throw new TRPCError({
           code: "INTERNAL_SERVER_ERROR",
           message: "Failed to delete document",

@@ -4,7 +4,10 @@ import NotFound from "@/pages/NotFound";
 import { Route, Switch } from "wouter";
 import ErrorBoundary from "./components/ErrorBoundary";
 import { ThemeProvider } from "./contexts/ThemeContext";
+import Admin from "./pages/Admin";
+import Analytics from "./pages/Analytics";
 import Home from "./pages/Home";
+import KnowledgeGraph from "./pages/KnowledgeGraph";
 import Documents from "./pages/Documents";
 import ResearchQuery from "./pages/ResearchQuery";
 
@@ -15,6 +18,9 @@ function Router() {
       <Route path="/" component={Home} />
       <Route path="/documents" component={Documents} />
       <Route path="/research" component={ResearchQuery} />
+      <Route path="/graph" component={KnowledgeGraph} />
+      <Route path="/analytics" component={Analytics} />
+      <Route path="/admin" component={Admin} />
       <Route path="/404" component={NotFound} />
       {/* Final fallback route */}
       <Route component={NotFound} />

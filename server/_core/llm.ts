@@ -1,4 +1,5 @@
 import { ENV } from "./env";
+import { resolveModelForRole, type ModelRole } from "./modelRegistry";
 
 export type Role = "system" | "user" | "assistant" | "tool" | "function";
 
@@ -66,6 +67,8 @@ export type InvokeParams = {
   output_schema?: OutputSchema;
   responseFormat?: ResponseFormat;
   response_format?: ResponseFormat;
+  model?: string;
+  modelRole?: ModelRole;
 };
 
 export type ToolCall = {
@@ -277,10 +280,14 @@ export async function invokeLLM(params: InvokeParams): Promise<InvokeResult> {
     output_schema,
     responseFormat,
     response_format,
+    model,
+    modelRole,
   } = params;
 
+  const selectedModel = resolveModelForRole(modelRole, model);
+
   const payload: Record<string, unknown> = {
-    model: "gemini-2.5-flash",
+    model: selectedModel,
     messages: messages.map(normalizeMessage),
   };
 
@@ -312,21 +319,43 @@ export async function invokeLLM(params: InvokeParams): Promise<InvokeResult> {
     payload.response_format = normalizedResponseFormat;
   }
 
-  const response = await fetch(resolveApiUrl(), {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      authorization: `Bearer ${ENV.forgeApiKey}`,
-    },
-    body: JSON.stringify(payload),
-  });
+  const sendRequest = async (model: string): Promise<InvokeResult> => {
+    payload.model = model;
 
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(
-      `LLM invoke failed: ${response.status} ${response.statusText} – ${errorText}`
+    const response = await fetch(resolveApiUrl(), {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${ENV.forgeApiKey}`,
+      },
+      body: JSON.stringify(payload),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(
+        `LLM invoke failed (${model}): ${response.status} ${response.statusText} – ${errorText}`
+      );
+    }
+
+    return (await response.json()) as InvokeResult;
+  };
+
+  try {
+    return await sendRequest(selectedModel);
+  } catch (primaryError) {
+    if (model) {
+      throw primaryError;
+    }
+
+    if (!ENV.fallbackChatModel || ENV.fallbackChatModel === selectedModel) {
+      throw primaryError;
+    }
+
+    console.warn(
+      `[LLM] Primary model '${selectedModel}' failed, retrying with fallback '${ENV.fallbackChatModel}'.`
     );
-  }
 
-  return (await response.json()) as InvokeResult;
+    return await sendRequest(ENV.fallbackChatModel);
+  }
 }

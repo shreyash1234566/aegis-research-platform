@@ -1,11 +1,14 @@
 import { z } from "zod";
 import { protectedProcedure, router } from "../_core/trpc";
 import {
+  createPerformanceMetric,
   createSynthesisQuery,
   getSynthesisQuery,
+  getSynthesisQueriesByUserId,
   updateSynthesisQueryStatus,
   createSynthesisReport,
   getSynthesisReport,
+  getSynthesisReportByQueryId,
   getClaimsByReportId,
   getContradictionsByReportId,
   createClaim,
@@ -14,6 +17,7 @@ import {
   getDocumentSummary,
 } from "../db";
 import { TRPCError } from "@trpc/server";
+import { enqueueSynthesisJob } from "../jobs/synthesisWorker";
 
 export const synthesisRouter = router({
   // Submit a new research query
@@ -47,12 +51,37 @@ export const synthesisRouter = router({
           status: "pending",
         });
 
+        const queryId = Number((result as { insertId?: number }).insertId);
+        if (!Number.isFinite(queryId)) {
+          throw new TRPCError({
+            code: "INTERNAL_SERVER_ERROR",
+            message: "Failed to create synthesis query",
+          });
+        }
+
+        // Queue synthesis execution asynchronously to avoid blocking API requests.
+        enqueueSynthesisJob({
+          queryId,
+          userId: ctx.user.id,
+          documentIds: input.documentIds,
+        });
+
+        await createPerformanceMetric({
+          metricType: "user_query_submit_count",
+          value: 1 as any,
+          queryId,
+          reportId: null,
+        });
+
         return {
-          queryId: (result as any).insertId,
+          queryId,
           status: "pending",
         };
       } catch (error) {
         console.error("Failed to submit query:", error);
+        if (error instanceof TRPCError) {
+          throw error;
+        }
         throw new TRPCError({
           code: "INTERNAL_SERVER_ERROR",
           message: "Failed to submit query",
@@ -75,6 +104,9 @@ export const synthesisRouter = router({
         return query;
       } catch (error) {
         console.error("Failed to get query:", error);
+        if (error instanceof TRPCError) {
+          throw error;
+        }
         throw new TRPCError({
           code: "INTERNAL_SERVER_ERROR",
           message: "Failed to get query",
@@ -85,16 +117,56 @@ export const synthesisRouter = router({
   // Get all queries for the current user
   listQueries: protectedProcedure.query(async ({ ctx }) => {
     try {
-      // TODO: Implement query listing
-      return [];
+      return await getSynthesisQueriesByUserId(ctx.user.id);
     } catch (error) {
       console.error("Failed to list queries:", error);
+      if (error instanceof TRPCError) {
+        throw error;
+      }
       throw new TRPCError({
         code: "INTERNAL_SERVER_ERROR",
         message: "Failed to list queries",
       });
     }
   }),
+
+  // Get synthesis report by query ID (useful for polling based flows)
+  getReportByQuery: protectedProcedure
+    .input(z.object({ queryId: z.number() }))
+    .query(async ({ ctx, input }) => {
+      try {
+        const query = await getSynthesisQuery(input.queryId);
+        if (!query || query.userId !== ctx.user.id) {
+          throw new TRPCError({
+            code: "FORBIDDEN",
+            message: "You do not have access to this query",
+          });
+        }
+
+        const report = await getSynthesisReportByQueryId(input.queryId);
+        if (!report) {
+          return null;
+        }
+
+        const claims = await getClaimsByReportId(report.id);
+        const contradictions = await getContradictionsByReportId(report.id);
+
+        return {
+          ...report,
+          claims,
+          contradictions,
+        };
+      } catch (error) {
+        console.error("Failed to get report by query:", error);
+        if (error instanceof TRPCError) {
+          throw error;
+        }
+        throw new TRPCError({
+          code: "INTERNAL_SERVER_ERROR",
+          message: "Failed to get report by query",
+        });
+      }
+    }),
 
   // Get synthesis report
   getReport: protectedProcedure
@@ -129,6 +201,9 @@ export const synthesisRouter = router({
         };
       } catch (error) {
         console.error("Failed to get report:", error);
+        if (error instanceof TRPCError) {
+          throw error;
+        }
         throw new TRPCError({
           code: "INTERNAL_SERVER_ERROR",
           message: "Failed to get report",
@@ -220,6 +295,9 @@ export const synthesisRouter = router({
         };
       } catch (error) {
         console.error("Failed to create report:", error);
+        if (error instanceof TRPCError) {
+          throw error;
+        }
         throw new TRPCError({
           code: "INTERNAL_SERVER_ERROR",
           message: "Failed to create report",
@@ -256,6 +334,9 @@ export const synthesisRouter = router({
         return summaries;
       } catch (error) {
         console.error("Failed to get document summaries:", error);
+        if (error instanceof TRPCError) {
+          throw error;
+        }
         throw new TRPCError({
           code: "INTERNAL_SERVER_ERROR",
           message: "Failed to get document summaries",

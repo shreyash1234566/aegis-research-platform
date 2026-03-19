@@ -1,5 +1,4 @@
-import { useState } from "react";
-import { useAuth } from "@/_core/hooks/useAuth";
+import { useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Textarea } from "@/components/ui/textarea";
@@ -8,11 +7,21 @@ import { trpc } from "@/lib/trpc";
 import { toast } from "sonner";
 import { Streamdown } from "streamdown";
 
+type SynthesisResultState = {
+  status: "processing" | "completed" | "error";
+  queryId: number;
+  report?: any;
+  error?: string;
+};
+
 export default function ResearchQuery() {
-  const { user } = useAuth();
   const [query, setQuery] = useState("");
   const [selectedDocuments, setSelectedDocuments] = useState<number[]>([]);
-  const [synthesisResult, setSynthesisResult] = useState<any>(null);
+  const [activeQueryId, setActiveQueryId] = useState<number | null>(null);
+  const [pollQueryStatus, setPollQueryStatus] = useState(false);
+  const [pollReport, setPollReport] = useState(false);
+  const [synthesisResult, setSynthesisResult] =
+    useState<SynthesisResultState | null>(null);
 
   // Fetch documents
   const { data: documents } = trpc.documents.list.useQuery();
@@ -21,7 +30,10 @@ export default function ResearchQuery() {
   const submitQueryMutation = trpc.synthesis.submitQuery.useMutation({
     onSuccess: (data) => {
       toast.success("Query submitted for synthesis");
-      // In a real implementation, poll for results or use WebSocket
+
+      setActiveQueryId(data.queryId);
+      setPollQueryStatus(true);
+      setPollReport(false);
       setSynthesisResult({
         status: "processing",
         queryId: data.queryId,
@@ -32,6 +44,90 @@ export default function ResearchQuery() {
       console.error(error);
     },
   });
+
+  const queryStatusQuery = trpc.synthesis.getQuery.useQuery(
+    { queryId: activeQueryId ?? 0 },
+    {
+      enabled: activeQueryId !== null && pollQueryStatus,
+      refetchInterval: 2000,
+      retry: false,
+    }
+  );
+
+  const reportQuery = trpc.synthesis.getReportByQuery.useQuery(
+    { queryId: activeQueryId ?? 0 },
+    {
+      enabled: activeQueryId !== null && pollReport,
+      refetchInterval: 2000,
+      retry: false,
+    }
+  );
+
+  useEffect(() => {
+    if (activeQueryId === null) return;
+
+    const status = queryStatusQuery.data?.status;
+    if (!status) return;
+
+    if (status === "pending" || status === "processing") {
+      setSynthesisResult({
+        status: "processing",
+        queryId: activeQueryId,
+      });
+      return;
+    }
+
+    if (status === "failed") {
+      setPollQueryStatus(false);
+      setPollReport(false);
+      setSynthesisResult({
+        status: "error",
+        queryId: activeQueryId,
+        error: "Synthesis failed. Please try again.",
+      });
+      return;
+    }
+
+    if (status === "completed") {
+      setPollQueryStatus(false);
+      setPollReport(true);
+    }
+  }, [activeQueryId, queryStatusQuery.data?.status]);
+
+  useEffect(() => {
+    if (activeQueryId === null) return;
+    if (!reportQuery.data) return;
+
+    setPollReport(false);
+    setSynthesisResult({
+      status: "completed",
+      queryId: activeQueryId,
+      report: reportQuery.data,
+    });
+  }, [activeQueryId, reportQuery.data]);
+
+  useEffect(() => {
+    if (!queryStatusQuery.error || activeQueryId === null) return;
+
+    setPollQueryStatus(false);
+    setPollReport(false);
+    setSynthesisResult({
+      status: "error",
+      queryId: activeQueryId,
+      error: queryStatusQuery.error.message,
+    });
+  }, [activeQueryId, queryStatusQuery.error]);
+
+  useEffect(() => {
+    if (!reportQuery.error || activeQueryId === null) return;
+
+    setPollReport(false);
+    setSynthesisResult({
+      status: "error",
+      queryId: activeQueryId,
+      error: reportQuery.error.message,
+    });
+  }, [activeQueryId, reportQuery.error]);
 
   const handleSubmitQuery = async () => {
     if (!query.trim()) {
